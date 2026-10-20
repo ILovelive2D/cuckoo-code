@@ -35,6 +35,8 @@ export async function loadSkills(): Promise<void> {
     listEl.innerHTML = html;
     listEl.querySelectorAll('.ck-skill-item').forEach((el: any) => {
       el.addEventListener('click', async () => {
+        // 已关闭的技能不加入上下文，点卡片不做任何事（不填提示词、不记最近使用）
+        if (el.classList.contains('ck-skill-off')) return;
         if (api.appendSnippet) {
           try { await api.appendSnippet('请使用 ' + el.dataset.name + ' 技能'); } catch (_) { /* ignore */ }
         }

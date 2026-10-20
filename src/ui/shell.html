@@ -3430,6 +3430,7 @@
       listEl2.innerHTML = html;
       listEl2.querySelectorAll(".ck-skill-item").forEach((el) => {
         el.addEventListener("click", async () => {
+          if (el.classList.contains("ck-skill-off")) return;
           if (api.appendSnippet) {
             try {
               await api.appendSnippet("\u8BF7\u4F7F\u7528 " + el.dataset.name + " \u6280\u80FD");
