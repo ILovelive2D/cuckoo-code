@@ -8,6 +8,8 @@ import { createRequire } from 'node:module';
 import * as windowState from './window.js';
 import * as profileManager from './profile.js';
 import { createSessionStore } from '../session/store.js';
+import { createLogicIdMap } from '../session/logic-id-map.js';
+import { initDatabase, migrateLegacyData } from '../session/db.js';
 import { getProvider } from '../providers/registry.js';
 import * as updater from '../updater/index.js';
 import * as mcpConfig from '../mcp/config.js';
@@ -34,7 +36,22 @@ try {
   console.error('[Cuckoo Code] 创建 userData 目录失败:', err.message);
 }
 app.setPath('userData', USER_DATA_DIR);
+// 尽早初始化日志（读 log-settings.json 决定是否落盘；后续所有 console.log 都会写入）
+try {
+  const { initLogging } = require('./ipc/logs.js');
+  initLogging();
+} catch (_) { /* ignore */ }
 console.log('[Cuckoo Code] Session 数据目录:', app.getPath('userData'));
+
+// 初始化 SQLite 数据库
+const globalDb = initDatabase(app.getPath('userData'));
+// 迁移老 JSON 数据
+migrateLegacyData(globalDb, app.getPath('userData'));
+
+/** 全局唯一的 logicId ↔ webId 翻译层 */
+const globalLogicIdMap = createLogicIdMap(globalDb);
+(global as any).__globalLogicIdMap = globalLogicIdMap;
+(global as any).__globalDb = globalDb;
 
 // 渲染进程日志输出目录（仅开发环境持久化；打包版不写日志文件）
 const RENDERER_LOG_DIR = app.isPackaged
@@ -53,6 +70,7 @@ if (RENDERER_LOG_DIR) {
 }
 
 import { registerIpcHandlers } from './ipc/index.js';
+import { injectSessionDeps } from './ipc/session.js';
 import { buildChromeUserAgent, buildClientHintsHeaders } from '../infra/user-agent.js';
 import { initFeishu } from './ipc/feishu.js';
 import { injectSubagentDeps, runAgent as runAgentImpl } from './subagent.js';
@@ -109,8 +127,12 @@ function clampBounds(b: any) {
 function createWindow(profile: any) {
   const profileData = profile || profileManager.getDefaultProfile();
   const provider = getProvider(profileData.providerId) || null;
-  const storeDir = app.getPath('userData');
-  const sessionStore = createSessionStore(profileData.id, storeDir, windowState);
+  const sessionStore = createSessionStore(profileData.id, globalDb, windowState, { logicIdMap: globalLogicIdMap });
+
+  // [022] 彻底废除 local-xxx 临时 ID。新窗口在发第一条消息之前，没有任何会话。
+  if (!sessionStore.state) sessionStore.state = {};
+  sessionStore.state.currentSessionId = null;
+
   const hasExplicitProfile = !!profile;
   // providerId 已确定 → 直接打开；未确定 → 显示平台选择页
   const providerChosen = !!profileData.providerId;
@@ -312,11 +334,16 @@ function createWindow(profile: any) {
     const [cw, ch] = mainWindow.getContentSize();
     const w = (mainWindow as any).__ckShellWidth || cw;
     const h = (mainWindow as any).__ckShellHeight || ch;
-    view.setBounds({
-      x: sbw, y: tbh,
-      width: Math.max(0, w - sbw),
-      height: Math.max(0, h - tbh - STATUS_HEIGHT),
-    });
+    // AI view 可见性（P3：点"插件"等主面板时，隐藏 AI view 让壳页面主区域露出来）
+    if ((mainWindow as any).__ckAiViewVisible === false) {
+      view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    } else {
+      view.setBounds({
+        x: sbw, y: tbh,
+        width: Math.max(0, w - sbw),
+        height: Math.max(0, h - tbh - STATUS_HEIGHT),
+      });
+    }
     // overlay（独立 BrowserWindow）覆盖整个"网页区域" —— 用屏幕坐标
     const ov = (mainWindow as any).__ckOverlayView;
     if (ov && !ov.isDestroyed()) {
@@ -342,6 +369,11 @@ function createWindow(profile: any) {
     }
   };
   (mainWindow as any).__ckLayout = layoutView;
+  /** 设置 AI view 可见性（P3 主面板切换用） */
+  (mainWindow as any).__ckSetAiViewVisible = (visible: boolean) => {
+    (mainWindow as any).__ckAiViewVisible = !!visible;
+    layoutView();
+  };
   layoutView();
   mainWindow.on('resize', layoutView);
   mainWindow.on('move', layoutView);
@@ -358,6 +390,15 @@ function createWindow(profile: any) {
       });
     }
   }
+
+  // 转发壳页面 console 到主进程日志（便于诊断插件加载 / 网络请求问题）
+  mainWindow.webContents.on('console-message', (_event: any, _level: any, message: any) => {
+    console.log('[Shell Console]', message);
+    try {
+      const { appendRendererLog } = require('./ipc/logs.js');
+      appendRendererLog('shell', message);
+    } catch (_) { /* ignore */ }
+  });
 
   // 加载地址栏壳页面；壳就绪后主动推一次当前 URL 状态（避免与 view 加载竞态）
   mainWindow.loadFile(resolveSrc('ui/shell.html'));
@@ -443,8 +484,12 @@ function createWindow(profile: any) {
   // 转发 AI 页面 console.log 到主进程，并按平台写入独立日志文件
   view.webContents.on('console-message', (_event: any, level: any, message: any, _line: any, _sourceId: any) => {
     console.log('[Renderer Console][' + profileData.name + ']', message);
+    try {
+      const { appendRendererLog } = require('./ipc/logs.js');
+      appendRendererLog('renderer[' + profileData.name + ']', message);
+    } catch (_) { /* ignore */ }
 
-    // 打包版不进行日志持久化
+    // 打包版不进行日志持久化（走上面 appendRendererLog）
     if (!RENDERER_LOG_DIR) return;
 
     // 根据当前窗口上下文确定 providerId，未确定用 default
@@ -749,6 +794,16 @@ function setupAppMenu() {
             try { (focusedWindow as any).__ckToggleHarness?.(); } catch (_) {}
           }
         },
+        {
+          label: '重新加载界面（壳页面）',
+          accelerator: 'CmdOrCtrl+Shift+R',
+          click: (_item: any, focusedWindow: any) => {
+            // 刷新壳页面（左侧栏 + 状态栏），不动 AI 页面
+            if (focusedWindow && focusedWindow.webContents && !focusedWindow.webContents.isDestroyed()) {
+              focusedWindow.webContents.reloadIgnoringCache();
+            }
+          }
+        },
         { type: 'separator' },
         { role: 'resetZoom', label: '重置缩放' },
         { role: 'zoomIn', label: '放大' },
@@ -790,6 +845,7 @@ function setupAppMenu() {
 
 // ========== 子代理依赖注入 ==========
 injectSubagentDeps({ createWindow, profileManager });
+injectSessionDeps({ createWindow, profileManager });
 // 给 runAgent 工具注入执行器（tools 层不依赖 app）
 injectAgentRunner(async ({ agent, task, currentWindowId }: any) => {
   const ctx = windowState.getWindowContext(currentWindowId);
@@ -1297,12 +1353,17 @@ if (!gotSingleInstanceLock) {
     import('../plugins/cuckoo-plugins/index.js').then((m: any) => {
       import('../tools/index.js').then((t: any) => {
         import('./cuckoo-host.js').then((h: any) => {
-        m.loadEnabledPlugins(t.registry, h.buildCuckooHost()).then((r: any) => {
-          if (r.loaded.length || r.failed.length) {
-            console.log('[Cuckoo Plugin] 已加载: ' + (r.loaded.join(' | ') || '(无)') +
-              (r.failed.length ? '；失败: ' + r.failed.map((f: any) => f.id + ':' + f.error).join(' | ') : ''));
-          }
-        }).catch((e: any) => console.error('[Cuckoo Plugin] 加载失败:', e && e.message));
+          const host = h.buildCuckooHost({ db: globalDb, logicIdMap: globalLogicIdMap, createWindow, profileManager });
+          m.loadEnabledPlugins(t.registry, host).then((r: any) => {
+            if (r.loaded.length || r.failed.length) {
+              console.log('[Cuckoo Plugin] 已加载: ' + (r.loaded.join(' | ') || '(无)') +
+                (r.failed.length ? '；失败: ' + r.failed.map((f: any) => f.id + ':' + f.error).join(' | ') : ''));
+            }
+            // 恢复所有待发队列（重启续跑）
+            import('../plugins/dsh-compat/agents-service.js').then((ag: any) => {
+              if (ag.restorePendingQueues) ag.restorePendingQueues(host);
+            }).catch(() => {});
+          }).catch((e: any) => console.error('[Cuckoo Plugin] 加载失败:', e && e.message));
         }).catch(() => {});
       });
     }).catch(() => {});
